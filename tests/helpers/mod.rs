@@ -111,6 +111,9 @@ pub fn compare_screens(
         got.mouse_protocol_encoding(),
         expected.mouse_protocol_encoding()
     );
+    is!(got.kitty_keyboard_mode(), expected.kitty_keyboard_mode());
+    is!(got.kitty_keyboard_stack(), expected.kitty_keyboard_stack());
+    is!(got.modify_other_keys(), expected.modify_other_keys());
 
     true
 }
@@ -193,8 +196,7 @@ pub fn contents_diff_reproduces_state_from_screens(
     diff_input.extend(screen.input_mode_diff(prev_screen));
     assert_eq!(diff_input, screen.state_diff(prev_screen));
 
-    let mut diff_prev_input = prev_screen.contents_formatted();
-    diff_prev_input.extend(screen.input_mode_formatted());
+    let diff_prev_input = prev_screen.state_formatted();
 
     let mut new_parser = vt100::Parser::default();
     new_parser.process(&diff_prev_input);

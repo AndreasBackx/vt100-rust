@@ -91,7 +91,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         _ignore: bool,
         c: char,
     ) {
-        let unhandled = |screen: &mut crate::screen::Screen| {
+        let mut unhandled = |screen: &mut crate::screen::Screen| {
             self.callbacks.unhandled_csi(
                 screen,
                 intermediates.first().copied(),
@@ -182,6 +182,94 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                         c,
                     );
                 }
+            },
+            // Kitty keyboard protocol and xterm modifyOtherKeys.
+            //
+            // The `>` byte (0x3E) is a "private marker" in the CSI
+            // sequence grammar (bytes 0x3C–0x3F), so vte places it in
+            // the `intermediates` slice — same treatment as `?` which
+            // is used for DECSET/DECRST above.
+            //
+            // Two different protocols share this intermediate:
+            //
+            // 1. Kitty keyboard protocol (final byte `u`):
+            //    Applications send `CSI > flags u` to push a keyboard
+            //    mode requesting enhanced key reporting — e.g. so that
+            //    Shift+Enter (CSI 13;2u) can be distinguished from
+            //    plain Enter (\r). See:
+            //    https://sw.kovidgoyal.net/kitty/keyboard-protocol/
+            //
+            // 2. xterm modifyOtherKeys (final byte `m`):
+            //    `CSI > 4 ; n m` sets the modifyOtherKeys level.
+            //    Only first-parameter 4 is handled; other values of
+            //    `CSI > n m` are unknown private sequences and fall
+            //    through to the unhandled callback. See:
+            //    https://invisible-island.net/xterm/manpage/xterm.html#VT100-Widget-Resources:modifyOtherKeys
+            Some(b'>') => match c {
+                'u' => {
+                    let flags = canonicalize_params_1(params, 0);
+                    self.screen.kitty_keyboard_push(flags);
+                }
+                'm' => {
+                    // CSI > Pp ; Pv m (XTMODKEYS) — set key modifier
+                    // resource. Pp identifies which resource (we only
+                    // track Pp=4, modifyOtherKeys). If no params are
+                    // given (Pp defaults to 0), all resources reset to
+                    // initial values. If Pv is omitted, the addressed
+                    // resource resets to its initial value.
+                    // https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+                    let mut iter = params.iter();
+                    let p = iter
+                        .next()
+                        .map_or(0, |x| *x.first().unwrap_or(&0));
+                    if p == 0 {
+                        // No params or Pp=0: reset all resources.
+                        // We only track modifyOtherKeys.
+                        self.screen.set_modify_other_keys(0);
+                    } else if p == 4 {
+                        let level = iter
+                            .next()
+                            .map_or(0, |x| *x.first().unwrap_or(&0));
+                        self.screen.set_modify_other_keys(
+                            u8::try_from(level).unwrap_or(u8::MAX),
+                        );
+                    } else {
+                        unhandled(&mut self.screen);
+                    }
+                }
+                'n' => {
+                    // CSI > Ps n — disable key modifier option
+                    // (XTMODKEYS). Sets the resource to -1 (fully
+                    // disabled). We track this as 0 since we use u8
+                    // and the semantic effect is the same: no
+                    // modifier encoding.
+                    let p = canonicalize_params_1(params, 0);
+                    if p == 4 {
+                        self.screen.set_modify_other_keys(0);
+                    }
+                }
+                _ => unhandled(&mut self.screen),
+            },
+            // CSI < [n] u — pop n entries from the kitty keyboard mode
+            // stack (default 1). Sent by applications on exit to
+            // restore the previous keyboard mode.
+            Some(b'<') => match c {
+                'u' => {
+                    let n = canonicalize_params_1(params, 1);
+                    self.screen.kitty_keyboard_pop(n);
+                }
+                _ => unhandled(&mut self.screen),
+            },
+            // CSI = flags ; mode u — modify the top entry on the kitty
+            // keyboard mode stack. The `mode` parameter is a
+            // disposition: 1=set, 2=bitwise-or, 3=bitwise-and-not.
+            Some(b'=') => match c {
+                'u' => {
+                    let (flags, mode) =
+                        canonicalize_params_2(params, 0, 1);
+                    self.screen.kitty_keyboard_set(flags, mode);
+                }
+                _ => unhandled(&mut self.screen),
             },
             Some(i) => {
                 self.callbacks.unhandled_csi(

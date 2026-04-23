@@ -62,6 +62,61 @@ pub struct Screen {
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
+
+    /// Stack of keyboard mode flags for the kitty keyboard protocol.
+    ///
+    /// The kitty keyboard protocol allows terminal applications to request
+    /// enhanced key reporting — for example, distinguishing Shift+Enter
+    /// from plain Enter, or reporting key release events. Without it, many
+    /// key combinations produce identical byte sequences.
+    ///
+    /// The protocol uses a stack so that nested applications (e.g. a shell
+    /// launching an editor) can each push their own mode and pop it on
+    /// exit without disturbing the parent's settings.
+    ///
+    /// Each entry is a bitmask of flags:
+    /// - `0x01` — Disambiguate escape codes
+    /// - `0x02` — Report event types (press/repeat/release)
+    /// - `0x04` — Report alternate keys
+    /// - `0x08` — Report all keys as escape codes
+    /// - `0x10` — Report associated text
+    ///
+    /// Controlled by these CSI sequences:
+    /// - `CSI > flags u`         — push a new mode onto the stack
+    /// - `CSI < [n] u`           — pop n modes (default 1)
+    /// - `CSI = flags ; mode u`  — modify the top entry (1=set, 2=or,
+    ///                             3=and-not)
+    ///
+    /// Capped at 16 entries to prevent unbounded growth from malicious
+    /// input; real applications typically push 1–2 entries.
+    ///
+    /// Note: the kitty spec recommends separate stacks for main and
+    /// alternate screens, but this crate uses a single stack (consistent
+    /// with how it handles all other modes like bracketed paste, mouse
+    /// protocol, etc.).
+    ///
+    /// See: <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>
+    kitty_keyboard_stack: Vec<u16>,
+
+    /// The xterm modifyOtherKeys level (0–3).
+    ///
+    /// modifyOtherKeys is an older xterm feature (predating the kitty
+    /// protocol) that controls whether the terminal reports modifier keys
+    /// on key combinations that normally don't distinguish modifiers.
+    ///
+    /// - Level 0: disabled (default) — modifiers are not reported for
+    ///   most keys
+    /// - Level 1: modifiers are reported for keys that don't have a
+    ///   well-known binding
+    /// - Level 2: modifiers are reported for all keys except a few
+    ///   special cases (e.g. Ctrl+C)
+    /// - Level 3: extends level 2 to also send unmodified keys as
+    ///   escape sequences
+    ///
+    /// Controlled by `CSI > 4 ; n m` where `n` is the level.
+    ///
+    /// See: <https://invisible-island.net/xterm/manpage/xterm.html#VT100-Widget-Resources:modifyOtherKeys>
+    modify_other_keys: u8,
 }
 
 impl Screen {
@@ -81,6 +136,9 @@ impl Screen {
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
             mouse_protocol_encoding: MouseProtocolEncoding::default(),
+
+            kitty_keyboard_stack: Vec::new(),
+            modify_other_keys: 0,
         }
     }
 
@@ -375,6 +433,8 @@ impl Screen {
     /// * application cursor
     /// * bracketed paste
     /// * xterm mouse support
+    /// * kitty keyboard protocol
+    /// * xterm modifyOtherKeys
     #[must_use]
     pub fn input_mode_formatted(&self) -> Vec<u8> {
         let mut contents = vec![];
@@ -403,6 +463,13 @@ impl Screen {
             MouseProtocolEncoding::Default,
         )
         .write_buf(contents);
+        crate::term::KittyKeyboardMode::new(
+            &self.kitty_keyboard_stack,
+            &[],
+        )
+        .write_buf(contents);
+        crate::term::ModifyOtherKeys::new(self.modify_other_keys, 0)
+            .write_buf(contents);
     }
 
     /// Returns terminal escape sequences sufficient to change the previous
@@ -445,6 +512,16 @@ impl Screen {
         crate::term::MouseProtocolEncoding::new(
             self.mouse_protocol_encoding,
             prev.mouse_protocol_encoding,
+        )
+        .write_buf(contents);
+        crate::term::KittyKeyboardMode::new(
+            &self.kitty_keyboard_stack,
+            &prev.kitty_keyboard_stack,
+        )
+        .write_buf(contents);
+        crate::term::ModifyOtherKeys::new(
+            self.modify_other_keys,
+            prev.modify_other_keys,
         )
         .write_buf(contents);
     }
@@ -585,6 +662,52 @@ impl Screen {
         self.mouse_protocol_encoding
     }
 
+    /// Returns the effective kitty keyboard protocol flags.
+    ///
+    /// This is the top entry on the keyboard mode stack, or `0` if the
+    /// stack is empty (meaning the protocol is not active). The flags are
+    /// a bitmask — see the [kitty keyboard protocol
+    /// spec](https://sw.kovidgoyal.net/kitty/keyboard-protocol/#progressive-enhancement)
+    /// for the meaning of each bit.
+    ///
+    /// When these flags are non-zero, the terminal is expected to encode
+    /// key presses using the CSI u format. For example, with flags `0x01`
+    /// (disambiguate), Shift+Enter is sent as `CSI 13;2u` rather than a
+    /// bare carriage return (`\r`).
+    #[must_use]
+    pub fn kitty_keyboard_mode(&self) -> u16 {
+        self.kitty_keyboard_stack.last().copied().unwrap_or(0)
+    }
+
+    /// Returns the full kitty keyboard protocol mode stack.
+    ///
+    /// Applications push entries with `CSI > flags u` and pop them with
+    /// `CSI < u`. The stack allows nested applications to independently
+    /// manage their keyboard modes. This accessor exposes the full stack
+    /// so that callers (e.g. terminal multiplexers) can save and restore
+    /// it across reconnections.
+    ///
+    /// See: <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>
+    #[must_use]
+    pub fn kitty_keyboard_stack(&self) -> &[u16] {
+        &self.kitty_keyboard_stack
+    }
+
+    /// Returns the current xterm modifyOtherKeys level (0–3).
+    ///
+    /// - `0` — disabled (the default)
+    /// - `1` — report modifiers for keys without well-known bindings
+    /// - `2` — report modifiers for all keys except a few special cases
+    /// - `3` — also send unmodified keys as escape sequences
+    ///
+    /// Set by `CSI > 4 ; n m`. See the [xterm
+    /// docs](https://invisible-island.net/xterm/manpage/xterm.html#VT100-Widget-Resources:modifyOtherKeys)
+    /// for details.
+    #[must_use]
+    pub fn modify_other_keys(&self) -> u8 {
+        self.modify_other_keys
+    }
+
     /// Returns the currently active foreground color.
     #[must_use]
     pub fn fgcolor(&self) -> crate::Color {
@@ -698,6 +821,64 @@ impl Screen {
         if self.mouse_protocol_encoding == encoding {
             self.mouse_protocol_encoding = MouseProtocolEncoding::default();
         }
+    }
+
+    // CSI > flags u — push kitty keyboard mode.
+    //
+    // Pushes a new entry onto the keyboard mode stack. The flags value
+    // is a bitmask controlling which enhanced key reporting features the
+    // application wants.
+    //
+    // Per the spec, if the stack is full the oldest entry is evicted
+    // to make room. The stack is capped at 16 entries.
+    //
+    // See:
+    // https://sw.kovidgoyal.net/kitty/keyboard-protocol/#progressive-enhancement
+    pub(crate) fn kitty_keyboard_push(&mut self, flags: u16) {
+        if self.kitty_keyboard_stack.len() >= 16 {
+            self.kitty_keyboard_stack.remove(0);
+        }
+        self.kitty_keyboard_stack.push(flags);
+    }
+
+    // CSI < [n] u — pop kitty keyboard mode(s).
+    //
+    // Pops `count` entries from the keyboard mode stack (default 1).
+    // If count exceeds the stack depth, the stack is simply cleared.
+    // Applications send this when they exit to restore the parent's
+    // keyboard mode.
+    pub(crate) fn kitty_keyboard_pop(&mut self, count: u16) {
+        let to_pop =
+            usize::from(count).min(self.kitty_keyboard_stack.len());
+        self.kitty_keyboard_stack
+            .truncate(self.kitty_keyboard_stack.len() - to_pop);
+    }
+
+    // CSI = flags ; mode u — modify the top kitty keyboard stack entry.
+    //
+    // The disposition `mode` controls how `flags` is applied:
+    //   1 (set)     — replace the top entry with `flags`
+    //   2 (or)      — bitwise OR `flags` into the top entry
+    //   3 (and-not) — clear the bits in `flags` from the top entry
+    //
+    // If the stack is empty, a new entry with value 0 is pushed first,
+    // then the disposition is applied.
+    pub(crate) fn kitty_keyboard_set(&mut self, flags: u16, mode: u16) {
+        if self.kitty_keyboard_stack.is_empty() {
+            self.kitty_keyboard_stack.push(0);
+        }
+        let top = self.kitty_keyboard_stack.last_mut().unwrap();
+        match mode {
+            1 => *top = flags,
+            2 => *top |= flags,
+            3 => *top &= !flags,
+            _ => {}
+        }
+    }
+
+    // CSI > 4 ; level m — set xterm modifyOtherKeys level.
+    pub(crate) fn set_modify_other_keys(&mut self, level: u8) {
+        self.modify_other_keys = level;
     }
 }
 

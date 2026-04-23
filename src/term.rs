@@ -545,6 +545,100 @@ impl BufWrite for MouseProtocolEncoding {
     }
 }
 
+/// Emits escape sequences to transition the kitty keyboard protocol
+/// mode stack from `prev_stack` to `stack`.
+///
+/// The kitty keyboard protocol uses a push/pop stack of flag bitmasks.
+/// Applications push a mode on startup (`CSI > flags u`) and pop it on
+/// exit (`CSI < u`), allowing nested programs to independently manage
+/// their keyboard settings.
+///
+/// This struct computes the minimal set of pops and pushes needed:
+/// it finds the longest common prefix between the two stacks, pops any
+/// divergent entries from the previous stack, and pushes any new entries
+/// from the current stack.
+///
+/// When restoring from scratch (e.g. `state_formatted()`), pass `&[]`
+/// as `prev_stack` — all entries will be pushed.
+///
+/// See: <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>
+#[derive(Debug)]
+#[must_use = "this struct does nothing unless you call write_buf"]
+pub struct KittyKeyboardMode<'a> {
+    stack: &'a [u16],
+    prev_stack: &'a [u16],
+}
+
+impl<'a> KittyKeyboardMode<'a> {
+    pub fn new(stack: &'a [u16], prev_stack: &'a [u16]) -> Self {
+        Self { stack, prev_stack }
+    }
+}
+
+impl BufWrite for KittyKeyboardMode<'_> {
+    fn write_buf(&self, buf: &mut Vec<u8>) {
+        if self.stack == self.prev_stack {
+            return;
+        }
+        let common = self
+            .stack
+            .iter()
+            .zip(self.prev_stack.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let to_pop = self.prev_stack.len() - common;
+        if to_pop > 0 {
+            buf.extend_from_slice(b"\x1b[<");
+            extend_itoa(buf, to_pop);
+            buf.push(b'u');
+        }
+        for &flags in &self.stack[common..] {
+            buf.extend_from_slice(b"\x1b[>");
+            extend_itoa(buf, flags);
+            buf.push(b'u');
+        }
+    }
+}
+
+/// Emits escape sequences to transition the xterm modifyOtherKeys level
+/// from `prev` to `level`.
+///
+/// modifyOtherKeys is an xterm feature that controls whether modifier
+/// keys are reported for key combinations that normally don't
+/// distinguish modifiers. For example, without it, Ctrl+i and Tab are
+/// both sent as `\t`; at level 2, Ctrl+i gets a distinct encoding.
+/// Level 3 extends this further to send even unmodified keys as escape
+/// sequences.
+///
+/// Emits `CSI > 4 ; n m` when the level changes. Even when disabling
+/// (setting to 0), the sequence is explicitly sent so the terminal
+/// doesn't remain in a stale state.
+///
+/// See: <https://invisible-island.net/xterm/manpage/xterm.html#VT100-Widget-Resources:modifyOtherKeys>
+#[derive(Default, Debug)]
+#[must_use = "this struct does nothing unless you call write_buf"]
+pub struct ModifyOtherKeys {
+    level: u8,
+    prev: u8,
+}
+
+impl ModifyOtherKeys {
+    pub fn new(level: u8, prev: u8) -> Self {
+        Self { level, prev }
+    }
+}
+
+impl BufWrite for ModifyOtherKeys {
+    fn write_buf(&self, buf: &mut Vec<u8>) {
+        if self.level == self.prev {
+            return;
+        }
+        buf.extend_from_slice(b"\x1b[>4;");
+        extend_itoa(buf, self.level);
+        buf.push(b'm');
+    }
+}
+
 fn extend_itoa<I: itoa::Integer>(buf: &mut Vec<u8>, i: I) {
     let mut itoa_buf = itoa::Buffer::new();
     buf.extend_from_slice(itoa_buf.format(i).as_bytes());
